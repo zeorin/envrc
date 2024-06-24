@@ -176,7 +176,7 @@ e.g. (define-key envrc-mode-map (kbd \"C-c e\") \\='envrc-command-map)"
 
 (defvar envrc--cache (make-hash-table :test 'equal :size 10)
   "Known envrc directories and their direnv results.
-The values are as produced by `envrc--export'.")
+The values are as produced by `envrc--diff'.")
 
 ;;; Local state
 
@@ -233,7 +233,7 @@ environments updated."
            (if env-dir
                (let ((cache-key (envrc--cache-key env-dir (default-value 'process-environment))))
                  (pcase (gethash cache-key envrc--cache 'missing)
-                   (`missing (let ((calculated (envrc--export env-dir)))
+                   (`missing (let ((calculated (envrc--diff env-dir)))
                                (puthash cache-key calculated envrc--cache)
                                calculated))
                    (cached cached)))
@@ -286,20 +286,22 @@ DIRECTORY is the directory in which the environment changes."
            (propertize (concat "(" (abbreviate-file-name (directory-file-name directory)) ")")
                        'face 'font-lock-comment-face)))
 
-(defun envrc--export (env-dir)
-  "Export the env vars for ENV-DIR using direnv.
-Return value is either \\='error, \\='none, or an alist of environment
-variable names and values."
+(defun envrc--command (env-dir command &rest args)
+  "Call COMMAND for ENV-DIR using direnv.
+Return value is either \\='error, \\='none, or the output as a string."
   (unless (envrc--env-dir-p env-dir)
     (error "%s is not a directory with a .envrc" env-dir))
-  (message "Running direnv in %s ... (C-g to abort)" env-dir)
+  (let* ((msg "Running direnv %s in %s (C-g to abort)")
+         (maxwidth (- (window-body-width) (- (length msg) (* (length "%s") 2)) (length env-dir))))
+    (message msg (truncate-string-to-width (mapconcat 'identity (append (list command) args) " ") maxwidth) env-dir))
   (let ((stderr-file (make-temp-file "envrc"))
         result)
     (unwind-protect
         (let ((default-directory env-dir))
           (with-temp-buffer
             (let ((exit-code (condition-case nil
-                                 (envrc--call-process-with-global-env envrc-direnv-executable nil (list t stderr-file) nil "export" "json")
+                                 (apply 'envrc--call-process-with-global-env
+                                        (append (list envrc-direnv-executable nil (list t stderr-file) nil command) args))
                                (quit
                                 (message "interrupted!!")
                                 'interrupted))))
@@ -314,10 +316,7 @@ variable names and values."
                     (if (zerop (buffer-size))
                         (setq result 'none)
                       (goto-char (point-min))
-                      (prog1
-                          (setq result (let ((json-key-type 'string)) (json-read-object)))
-                        (when envrc-show-summary-in-minibuffer
-                          (envrc--show-summary result env-dir)))))
+                      (setq result (buffer-string))))
                 (message "Direnv failed in %s" env-dir)
                 (setq result 'error))
               (envrc--at-end-of-special-buffer "*envrc*"
@@ -332,6 +331,32 @@ variable names and values."
                   (display-buffer (current-buffer)))))))
       (delete-file stderr-file))
     result))
+
+(defun envrc--command-json (env-dir command &rest args)
+  "Call COMMAND for ENV-DIR using direnv.
+Return value is either \\='error, \\='none, or an alist of the output parsed as
+JSON."
+  (let ((result (apply 'envrc--command (append (list env-dir command) args))))
+    (unless (memq result '(none error))
+      (setq result (let ((json-key-type 'string))
+                     (json-read-from-string result))))
+    result))
+
+(defun envrc--diff (env-dir)
+  "Get DIRENV_DIFF for ENV-DIR, using direnv.
+Return value is either \\='error, \\='none, or an alist of \"n\" and \"p\",
+themselves alists of the next and previous environment variable names and
+values, respectively."
+  (let ((result (envrc--command-json env-dir "exec" env-dir envrc-direnv-executable "dump" "json")))
+    (unless (memq result '(none error))
+      (let ((diff (cdr (assoc "DIRENV_DIFF" result))))
+        (if diff
+            (progn
+              (setq result (envrc--command-json env-dir "show_dump" diff))
+              (when (and envrc-show-summary-in-minibuffer (not (memq result '(none error))))
+                (envrc--show-summary (cdr (assoc "n" result)) env-dir)))
+          (setq result 'none)))
+      result)))
 
 ;; Forward declaration for the byte compiler
 (defvar eshell-path-env)
@@ -363,7 +388,7 @@ also appear in PAIRS."
 
 
 (defun envrc--apply (buf result)
-  "Update BUF with RESULT, which is a result of `envrc--export'."
+  "Update BUF with RESULT, which is a result of `envrc--diff'."
   (with-current-buffer buf
     (setq-local envrc--status (if (listp result) 'on result))
     (if (memq result '(none error))
@@ -377,9 +402,12 @@ also appear in PAIRS."
                    (default-value (if remote
                                       'tramp-remote-process-environment
                                     'process-environment))
-                   result))
-             (path (getenv-internal "PATH" env))
-             (parsed-path (parse-colon-path path)))
+                   (cdr (assoc "n" result))))
+             (prev-path (parse-colon-path (cdr (assoc "PATH" (cdr (assoc "p" result))))))
+             (next-path (parse-colon-path (cdr (assoc "PATH" (cdr (assoc "n" result))))))
+             (path-removed (cl-set-difference prev-path next-path))
+             (path-added (cl-set-difference next-path prev-path))
+             (parsed-path (append path-added (cl-set-difference (default-value 'exec-path) path-removed))))
         (if remote
             (setq-local tramp-remote-process-environment env)
           (setq-local process-environment env))
@@ -389,8 +417,8 @@ also appear in PAIRS."
           (setq-local exec-path parsed-path))
         (when (derived-mode-p 'eshell-mode)
           (if (fboundp 'eshell-set-path)
-              (eshell-set-path path)
-            (setq-local eshell-path-env path)))
+              (eshell-set-path next-path)
+            (setq-local eshell-path-env next-path)))
         (when-let ((info-path (getenv-internal "INFOPATH" env)))
           (setq-local Info-directory-list
                       (seq-filter #'identity (parse-colon-path info-path))))))))
